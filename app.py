@@ -986,7 +986,7 @@ def buat_excel_bytes(hasil_list, label_kosong, cfg):
 # ==================================================================
 # ANTARMUKA PENGGUNA (STREAMLIT UI)
 # ==================================================================
-st.title("🚚 Optimasi & Perencanaan Rute Pengiriman")
+st.title("🚚 Optimasi & Perencanaan Rute Pengiriman - thea Corp")
 st.caption("Upload file ekspor Odoo (.csv / .xlsx) untuk menghitung urutan rute optimal, estimasi waktu tempuh, peta jalan, dan laporan Excel multi-sheet.")
 
 with st.sidebar:
