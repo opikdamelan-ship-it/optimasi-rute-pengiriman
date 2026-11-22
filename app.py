@@ -21,6 +21,28 @@ st.set_page_config(
 )
 
 # ==========================================
+# GERBANG PASSWORD AKSES WEBSITE
+# ==========================================
+def cek_password():
+    if st.session_state.get("akses_valid"):
+        return True
+
+    st.title("🔒 Akses Terbatas - Optimasi Rute Pengiriman")
+    st.caption("Silakan masukkan password akses yang diberikan admin untuk menggunakan aplikasi ini.")
+
+    pwd_input = st.text_input("Password Akses", type="password", placeholder="Ketik password di sini...")
+    if st.button("Masuk", type="primary"):
+        pwd_benar = st.secrets.get("APP_PASSWORD", "theacorp")
+        if pwd_input == pwd_benar:
+            st.session_state["akses_valid"] = True
+            st.rerun()
+        else:
+            st.error("Password salah. Silakan coba lagi.")
+    return False
+
+if not cek_password():
+    st.stop()
+# ==========================================
 # KONFIGURASI PROXY (OPSIONAL VIA SECRETS/ENV)
 # ==========================================
 # Di cloud (Streamlit), proxy tidak diperlukan (otomatis kosong).
