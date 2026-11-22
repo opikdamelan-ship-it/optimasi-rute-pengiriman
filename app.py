@@ -15,7 +15,7 @@ import streamlit as st
 # KONFIGURASI HALAMAN WEB
 # ==========================================
 st.set_page_config(
-    page_title="Optimasi Rute Pengiriman Odoo",
+    page_title="Optimasi Rute Pengiriman - the@ Corp",
     page_icon="🚚",
     layout="wide",
 )
