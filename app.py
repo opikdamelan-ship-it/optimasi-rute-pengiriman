@@ -45,6 +45,7 @@ if not cek_password():
     st.stop()
 
 
+
 # ==========================================
 # KONFIGURASI PROXY (OPSIONAL VIA SECRETS/ENV)
 # ==========================================
@@ -274,6 +275,7 @@ def gabungkan_5_proses_csv(df, status_box=None):
 # OSRM: rute per leg dan matriks waktu (retry, multi-server, cache aman)
 # ------------------------------------------------------------------
 _HEADERS = {"User-Agent": "rute-pengiriman-odoo/1.0"}
+OSRM_LOG = []  # alasan kegagalan, untuk diagnostik
 
 
 def _osrm_get(path_query):
@@ -286,6 +288,7 @@ def _osrm_get(path_query):
                 resp = session.get(base + path_query, timeout=OSRM_TIMEOUT, headers=_HEADERS)
                 if resp.status_code in (429, 500, 502, 503, 504):
                     terakhir = f"{base} HTTP {resp.status_code}"
+                    OSRM_LOG.append(terakhir)
                     ra = resp.headers.get("Retry-After")
                     if ra and ra.isdigit():
                         time.sleep(min(int(ra), 10))
@@ -299,10 +302,12 @@ def _osrm_get(path_query):
                 if data.get("code") in ("NoRoute", "NoSegment"):
                     raise RuntimeError(data.get("code"))  # tidak ada gunanya diulang
                 terakhir = f"{base} {data.get('code')}"
+                OSRM_LOG.append(terakhir)
             except RuntimeError:
                 raise
             except Exception as e:
-                terakhir = f"{base} {type(e).__name__}"
+                terakhir = f"{base} {type(e).__name__}: {str(e)[:120]}"
+                OSRM_LOG.append(terakhir)
         time.sleep(OSRM_BACKOFF * (2 ** percobaan))
     raise RuntimeError(terakhir)
 
@@ -1193,6 +1198,9 @@ if uploaded_file is not None:
         st.session_state["nama_excel"] = f"{base_name}_HASIL_RUTE.xlsx"
         st.session_state["daftar_ringkas"] = daftar_ringkas
         st.session_state["peta_preview"] = peta_preview
+        from collections import Counter
+        st.session_state["osrm_diag"] = Counter(OSRM_LOG).most_common(5)
+        st.session_state["osrm_servers"] = list(OSRM_BASE_URLS)
         st.session_state["ada_estimasi"] = any(
             x["sumber"] == "ESTIMASI" for res in hasil_list for x in res["rows"]
         )
@@ -1211,6 +1219,14 @@ if "hasil_excel" in st.session_state:
 
     if st.session_state.get("ada_estimasi"):
         st.warning("Catatan: Sebagian leg memakai jarak ESTIMASI garis lurus karena server OSRM tidak terjangkau setelah beberapa kali percobaan. Klik proses ulang: leg yang sudah berhasil tersimpan di cache, jadi hanya yang gagal yang dicoba lagi.")
+        with st.expander("Detail teknis OSRM (untuk diagnosa)"):
+            st.write("Server dicoba:", st.session_state.get("osrm_servers"))
+            diag = st.session_state.get("osrm_diag") or []
+            if diag:
+                for alasan, jml in diag:
+                    st.code(f"{jml}x  {alasan}")
+            else:
+                st.write("Tidak ada error tercatat (kemungkinan hasil dari proses sebelumnya).")
 
     st.subheader("📋 Ringkasan Rute")
     df_ringkas = pd.DataFrame(st.session_state["daftar_ringkas"])
