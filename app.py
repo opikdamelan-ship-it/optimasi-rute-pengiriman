@@ -15,10 +15,11 @@ import streamlit as st
 # KONFIGURASI HALAMAN WEB
 # ==========================================
 st.set_page_config(
-    page_title="Optimasi Rute Pengiriman - the@ Corp",
+    page_title="Optimasi Rute Pengiriman Odoo",
     page_icon="🚚",
     layout="wide",
 )
+
 
 # ==========================================
 # GERBANG PASSWORD AKSES WEBSITE
@@ -42,6 +43,8 @@ def cek_password():
 
 if not cek_password():
     st.stop()
+
+
 # ==========================================
 # KONFIGURASI PROXY (OPSIONAL VIA SECRETS/ENV)
 # ==========================================
@@ -78,10 +81,31 @@ DOC_CANDIDATES = ["dokumen"]
 
 MANUAL_KOORDINAT = {}
 
-OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving/{coords}"
-OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/{coords}"
-OSRM_TIMEOUT = 25
-OSRM_DELAY = 0.3
+# Server OSRM. Bisa diisi lebih dari satu (pisah koma) lewat env/secrets OSRM_URL,
+# contoh: OSRM_URL="http://IP-VPS-KAMU:5000". Server publik selalu jadi cadangan terakhir.
+OSRM_PUBLIK = "https://router.project-osrm.org"
+
+
+def _ambil_osrm_url():
+    nilai = os.environ.get("OSRM_URL", "")
+    if not nilai:
+        try:
+            nilai = st.secrets.get("OSRM_URL", "")
+        except Exception:
+            nilai = ""
+    urls = [u.strip().rstrip("/") for u in str(nilai).split(",") if u.strip()]
+    if OSRM_PUBLIK not in urls:
+        urls.append(OSRM_PUBLIK)
+    return urls
+
+
+OSRM_BASE_URLS = _ambil_osrm_url()
+OSRM_TIMEOUT = 20
+OSRM_RETRY = 4            # jumlah putaran percobaan (tiap putaran coba semua server)
+OSRM_BACKOFF = 1.5        # detik, dikali 2 tiap putaran: 1.5, 3, 6, ...
+OSRM_DELAY = 0.3          # jeda sopan HANYA untuk server publik
+OSRM_TABLE_BLOK = 50      # blok sumber x tujuan, total koordinat <= 100
+OSRM_CACHE_DB = os.path.join(tempfile.gettempdir(), "osrm_leg_cache.sqlite")
 FALLBACK_FACTOR = 1.3
 
 MAP_W_IN, MAP_H_IN, MAP_DPI = 9, 6.5, 100
@@ -247,29 +271,104 @@ def gabungkan_5_proses_csv(df, status_box=None):
 
 
 # ------------------------------------------------------------------
-# OSRM: rute per leg dan matriks waktu
+# OSRM: rute per leg dan matriks waktu (retry, multi-server, cache aman)
 # ------------------------------------------------------------------
-@st.cache_data(ttl=86400, show_spinner=False)
-def jarak_osrm(lat1, lng1, lat2, lng2, fallback_speed_kmh):
-    coords = f"{lng1},{lat1};{lng2},{lat2}"
-    url = OSRM_ROUTE_URL.format(coords=coords) + "?overview=full&geometries=geojson"
-    hasil = None
+_HEADERS = {"User-Agent": "rute-pengiriman-odoo/1.0"}
+
+
+def _osrm_get(path_query):
+    """GET ke OSRM dengan retry + backoff + failover antar server.
+    Return data JSON bila code == Ok, selain itu raise RuntimeError."""
+    terakhir = "tidak ada respons"
+    for percobaan in range(OSRM_RETRY):
+        for base in OSRM_BASE_URLS:
+            try:
+                resp = session.get(base + path_query, timeout=OSRM_TIMEOUT, headers=_HEADERS)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    terakhir = f"{base} HTTP {resp.status_code}"
+                    ra = resp.headers.get("Retry-After")
+                    if ra and ra.isdigit():
+                        time.sleep(min(int(ra), 10))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") == "Ok":
+                    if base == OSRM_PUBLIK:
+                        time.sleep(OSRM_DELAY)
+                    return data
+                if data.get("code") in ("NoRoute", "NoSegment"):
+                    raise RuntimeError(data.get("code"))  # tidak ada gunanya diulang
+                terakhir = f"{base} {data.get('code')}"
+            except RuntimeError:
+                raise
+            except Exception as e:
+                terakhir = f"{base} {type(e).__name__}"
+        time.sleep(OSRM_BACKOFF * (2 ** percobaan))
+    raise RuntimeError(terakhir)
+
+
+# --- cache leg permanen (SQLite). Hanya hasil OSRM sukses yang disimpan. ---
+def _cache_conn():
+    import sqlite3
+    con = sqlite3.connect(OSRM_CACHE_DB, timeout=10)
+    con.execute("CREATE TABLE IF NOT EXISTS leg (k TEXT PRIMARY KEY, v TEXT, t REAL)")
+    return con
+
+
+def _cache_get(k):
+    import json
     try:
-        resp = session.get(url, timeout=OSRM_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == "Ok" and data.get("routes"):
-            rt = data["routes"][0]
-            geom = [tuple(p) for p in rt["geometry"]["coordinates"]]
-            hasil = (rt["distance"] / 1000.0, rt["duration"] / 60.0, "OSRM", geom)
-        time.sleep(OSRM_DELAY)
+        con = _cache_conn()
+        row = con.execute("SELECT v, t FROM leg WHERE k=?", (k,)).fetchone()
+        con.close()
+        if row and time.time() - row[1] < 30 * 86400:
+            km, mnt, geom = json.loads(row[0])
+            return km, mnt, [tuple(p) for p in geom]
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(k, km, mnt, geom):
+    import json
+    try:
+        con = _cache_conn()
+        con.execute("INSERT OR REPLACE INTO leg VALUES (?,?,?)", (k, json.dumps([km, mnt, geom]), time.time()))
+        con.commit()
+        con.close()
     except Exception:
         pass
 
-    if hasil is None:
+
+def jarak_osrm(lat1, lng1, lat2, lng2, fallback_speed_kmh):
+    # Sengaja TANPA st.cache_data: hasil ESTIMASI tidak boleh ikut ter-cache 24 jam.
+    k = f"{lat1:.6f},{lng1:.6f};{lat2:.6f},{lng2:.6f}"
+    c = _cache_get(k)
+    if c:
+        return (c[0], c[1], "OSRM", c[2])
+    try:
+        data = _osrm_get(
+            f"/route/v1/driving/{lng1},{lat1};{lng2},{lat2}?overview=full&geometries=geojson"
+        )
+        rt = data["routes"][0]
+        geom = [tuple(p) for p in rt["geometry"]["coordinates"]]
+        km, mnt = rt["distance"] / 1000.0, rt["duration"] / 60.0
+        _cache_set(k, km, mnt, geom)
+        return (km, mnt, "OSRM", geom)
+    except Exception:
         km = haversine_km(lat1, lng1, lat2, lng2) * FALLBACK_FACTOR
-        hasil = (km, km / fallback_speed_kmh * 60.0, "ESTIMASI", [(lng1, lat1), (lng2, lat2)])
-    return hasil
+        return (km, km / fallback_speed_kmh * 60.0, "ESTIMASI", [(lng1, lat1), (lng2, lat2)])
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _tabel_blok(src_pts, dst_pts):
+    """Satu blok matriks durasi (menit). Raise bila gagal -> tidak ikut ter-cache."""
+    pts = list(src_pts) + list(dst_pts)
+    coords = ";".join(f"{lng},{lat}" for lat, lng in pts)
+    s = ";".join(str(i) for i in range(len(src_pts)))
+    d = ";".join(str(len(src_pts) + i) for i in range(len(dst_pts)))
+    data = _osrm_get(f"/table/v1/driving/{coords}?annotations=duration&sources={s}&destinations={d}")
+    return data["durations"]
 
 
 def matriks_waktu(points, fallback_speed_kmh):
@@ -279,24 +378,29 @@ def matriks_waktu(points, fallback_speed_kmh):
         km = haversine_km(points[i][0], points[i][1], points[j][0], points[j][1]) * FALLBACK_FACTOR
         return km / fallback_speed_kmh * 60.0
 
-    if n <= 100:
-        coords = ";".join(f"{lng},{lat}" for lat, lng in points)
-        url = OSRM_TABLE_URL.format(coords=coords) + "?annotations=duration"
-        try:
-            resp = session.get(url, timeout=OSRM_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") == "Ok" and data.get("durations"):
-                dur = data["durations"]
-                m = [
-                    [(dur[i][j] / 60.0) if dur[i][j] is not None else estimasi(i, j) for j in range(n)]
-                    for i in range(n)
-                ]
-                return m, "OSRM"
-        except Exception:
-            pass
+    m = [[0.0 if i == j else None for j in range(n)] for i in range(n)]
+    pts = [tuple(p) for p in points]
+    blok = max(1, OSRM_TABLE_BLOK)
+    gagal = 0
+    for a in range(0, n, blok):
+        for b in range(0, n, blok):
+            src_idx = range(a, min(a + blok, n))
+            dst_idx = range(b, min(b + blok, n))
+            try:
+                dur = _tabel_blok(tuple(pts[i] for i in src_idx), tuple(pts[j] for j in dst_idx))
+                for ii, i in enumerate(src_idx):
+                    for jj, j in enumerate(dst_idx):
+                        v = dur[ii][jj]
+                        if i != j and v is not None:
+                            m[i][j] = v / 60.0
+            except Exception:
+                gagal += 1
 
-    return [[0.0 if i == j else estimasi(i, j) for j in range(n)] for i in range(n)], "ESTIMASI"
+    for i in range(n):
+        for j in range(n):
+            if m[i][j] is None:
+                m[i][j] = estimasi(i, j)
+    return m, ("OSRM" if gagal == 0 else "ESTIMASI")
 
 
 # ------------------------------------------------------------------
@@ -986,7 +1090,7 @@ def buat_excel_bytes(hasil_list, label_kosong, cfg):
 # ==================================================================
 # ANTARMUKA PENGGUNA (STREAMLIT UI)
 # ==================================================================
-st.title("🚚 Optimasi & Perencanaan Rute Pengiriman - thea Corp")
+st.title("🚚 Optimasi & Perencanaan Rute Pengiriman")
 st.caption("Upload file ekspor Odoo (.csv / .xlsx) untuk menghitung urutan rute optimal, estimasi waktu tempuh, peta jalan, dan laporan Excel multi-sheet.")
 
 with st.sidebar:
@@ -1106,7 +1210,7 @@ if "hasil_excel" in st.session_state:
     )
 
     if st.session_state.get("ada_estimasi"):
-        st.warning("Catatan: Sebagian leg memakai jarak ESTIMASI garis lurus karena server OSRM sedang sibuk/tidak terjangkau.")
+        st.warning("Catatan: Sebagian leg memakai jarak ESTIMASI garis lurus karena server OSRM tidak terjangkau setelah beberapa kali percobaan. Klik proses ulang: leg yang sudah berhasil tersimpan di cache, jadi hanya yang gagal yang dicoba lagi.")
 
     st.subheader("📋 Ringkasan Rute")
     df_ringkas = pd.DataFrame(st.session_state["daftar_ringkas"])
